@@ -126,6 +126,7 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
         add_hs: bool = False,  # NOTE: Needs to be true if using REAL reactions
         building_blocks_costs: Optional[dict] = BUILDING_BLOCKS_COSTS,
         strict_bck_masking: bool = True,
+        t5_config: Optional[dict] = None, ### NEW argument for T5
     ):
         """An env context for generating molecules by sequentially applying reaction templates.
         Contains functionalities to build molecular create masks for actions, and convert molecules to other representations.
@@ -180,8 +181,22 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
         self.reactions = [Reaction(template=t) for t in reaction_templates]  # Reaction objects
         self.unimolecular_reactions = [r for r in self.reactions if r.num_reactants == 1]  # rdKit reaction objects
         self.bimolecular_reactions = [r for r in self.reactions if r.num_reactants == 2]
-        self.num_unimolecular_rxns = len(self.unimolecular_reactions)
-        self.num_bimolecular_rxns = len(self.bimolecular_reactions)
+        #self.num_unimolecular_rxns = len(self.unimolecular_reactions)
+        #self.num_bimolecular_rxns = len(self.bimolecular_reactions)
+
+        ### NEW: Number of *template* reactions. When ReactionT5 is enabled, virtual reactions are appended
+        ### after the templates in BOTH categories, so the ReactUni / ReactBi / BckReactUni / BckReactBi /
+        ### AddReactant heads automatically grow. For bimolecular, index i >= num_template_bimolecular_rxns
+        ### means "ReactionT5 bimolecular, beam slot (i - num_template_bimolecular_rxns)"; likewise for
+        ### unimolecular. A unimolecular T5 action runs the model on the state alone (one reactant, no bb).
+        self.num_template_unimolecular_rxns = len(self.unimolecular_reactions)
+        self.num_template_bimolecular_rxns = len(self.bimolecular_reactions)
+        self.t5_config = dict(t5_config) if t5_config else None
+        self.num_t5_bi_slots = int(self.t5_config.get("num_bi_slots", 0)) if self.t5_config else 0
+        self.num_t5_uni_slots = int(self.t5_config.get("num_uni_slots", 0)) if self.t5_config else 0
+        self.num_unimolecular_rxns = self.num_template_unimolecular_rxns + self.num_t5_uni_slots
+        self.num_bimolecular_rxns = self.num_template_bimolecular_rxns + self.num_t5_bi_slots
+        self._t5_backend = None  # loaded lazily, once per process (see `t5`)
 
         if rev_reaction_templates is not None:
             self.reverse_reactions = [Reaction(template=t) for t in rev_reaction_templates]
@@ -248,7 +263,70 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
             self.action_type_order.remove(GraphActionType.ReactUni)
             self.bck_action_type_order.remove(GraphActionType.BckReactUni)
 
+        self._t5_allowed_atoms = list(atoms) ### NEW
         _global_synth_ctx_instance[0] = self
+
+    ### NEW: ReactionT5 helpers
+    def is_t5_bi_rxn(self, bimolecular_rxn_idx: int) -> bool:
+        return self.num_t5_bi_slots > 0 and bimolecular_rxn_idx >= self.num_template_bimolecular_rxns
+
+    def is_t5_uni_rxn(self, unimolecular_rxn_idx: int) -> bool:
+        return self.num_t5_uni_slots > 0 and unimolecular_rxn_idx >= self.num_template_unimolecular_rxns
+
+    def t5_bi_slot(self, bimolecular_rxn_idx: int) -> int:
+        return bimolecular_rxn_idx - self.num_template_bimolecular_rxns
+
+    def t5_uni_slot(self, unimolecular_rxn_idx: int) -> int:
+        return unimolecular_rxn_idx - self.num_template_unimolecular_rxns
+
+    # Signed slot id used as the ProvenanceStore key, so unimolecular and bimolecular edges to the
+    # same product never collide: bimolecular slot k -> k, unimolecular slot k -> -(k + 1).
+    @staticmethod
+    def bi_slot_id(k: int) -> int:
+        return k
+
+    @staticmethod
+    def uni_slot_id(k: int) -> int:
+        return -(k + 1)
+
+    @property
+    def t5(self):
+        """(ReactionT5Forward, ProvenanceStore), loaded lazily so the model is created inside each worker
+        process (CUDA + fork-safe) and shared between the task's ctx and the env's ctx."""
+        if self._t5_backend is None:
+            from synflownet.utils.reaction_t5 import get_t5_backend
+
+            env_only = ("bb_mask", "max_state_heavy_atoms", "num_bi_slots", "num_uni_slots")
+            kw = {k: v for k, v in self.t5_config.items() if k not in env_only}
+            # the wrapper must return enough distinct products for whichever category needs the most
+            kw["num_slots"] = max(self.num_t5_bi_slots, self.num_t5_uni_slots)
+            kw.setdefault("allowed_atoms", self._t5_allowed_atoms)
+            kw["allowed_atoms"] = tuple(kw["allowed_atoms"])
+            self._t5_backend = get_t5_backend(**kw)
+        return self._t5_backend
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        d["_t5_backend"] = None  # never pickle the HF model
+        return d
+
+    def state_smiles(self, smi: Union[str, Chem.Mol, Graph]) -> str:
+        """SMILES of a state exactly as the env sees it (graph round-trip, no stereo)."""
+        mol = self.get_mol(smi)
+        if not isinstance(smi, Graph):
+            mol = self.graph_to_obj(self.obj_to_graph(mol))
+        return Chem.MolToSmiles(mol)
+
+    def t5_bck_mask(self, smi: Union[str, Chem.Mol, Graph], kind: str) -> np.ndarray:
+        """1 for every T5 slot (of the given kind) through which this molecule has been produced."""
+        n = self.num_t5_uni_slots if kind == "uni" else self.num_t5_bi_slots
+        if n == 0:
+            return np.zeros(0)
+        key = self.state_smiles(smi)
+        store = self.t5[1]
+        slot_id = self.uni_slot_id if kind == "uni" else self.bi_slot_id
+        return np.array([store.get(key, slot_id(k)) is not None for k in range(n)], dtype=np.float64)
+    ### end NEW
 
     def aidx_to_action_type(self, aidx: ActionIndex, fwd: bool = True):
         if fwd:
@@ -413,10 +491,47 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
                                         break
                                 else:
                                     masks[idx] = 0
+
+            ### NEW: ReactionT5 slots occupy the tail of each reaction head.
+            cap = self.t5_config.get("max_state_heavy_atoms") if self.t5_config else None
+            fwd_allowed = cap is None or mol.GetNumHeavyAtoms() <= cap
+            if self.num_t5_bi_slots > 0 and action_type is GraphActionType.ReactBi:
+                # T5 can be asked about any (state, bb) pair; optionally cap the state size.
+                masks[self.num_template_bimolecular_rxns :] = 1.0 if fwd_allowed else 0.0
+            elif self.num_t5_bi_slots > 0 and action_type is GraphActionType.BckReactBi:
+                # A T5 slot is a valid backward action only if we recorded that edge going forward.
+                masks[self.num_template_bimolecular_rxns :] = self.t5_bck_mask(smi, "bi")
+            elif self.num_t5_uni_slots > 0 and action_type is GraphActionType.ReactUni:
+                # Unimolecular T5: run the model on the state alone (no building block).
+                masks[self.num_template_unimolecular_rxns :] = 1.0 if fwd_allowed else 0.0
+            elif self.num_t5_uni_slots > 0 and action_type is GraphActionType.BckReactUni:
+                masks[self.num_template_unimolecular_rxns :] = self.t5_bck_mask(smi, "uni")
+
             return masks  # type: ignore
+
+    ### NEW
+    def t5_bb_mask(self) -> np.ndarray:
+        """Building blocks that may be used as the 2nd reactant of a T5 reaction (same for every state)."""
+        if getattr(self, "_t5_bb_mask", None) is None:
+            mode = self.t5_config.get("bb_mask", "all")
+            if mode == "all" or self.precomputed_bb_masks is None:
+                m = np.ones(self.num_building_blocks)
+            elif mode == "template_reactive":
+                # BBs that participate in at least one template reaction
+                m = self.precomputed_bb_masks.any(axis=(0, 1)).astype(np.float64)
+            else:
+                raise ValueError(f"Unknown t5 bb_mask mode {mode}")
+            self._t5_bb_mask = m
+        return self._t5_bb_mask
+
 
     def create_masks_for_bb(self, smi: Union[str, Chem.Mol, Graph], bimolecular_row_idx: int) -> List[bool]:  # type: ignore
         """Create masks for building blocks for a given molecule."""
+
+        ### NEW: Just use the helper function for T5 reaction
+        if self.is_t5_bi_rxn(bimolecular_row_idx):
+            return self.t5_bb_mask()
+        
         mol = self.get_mol(smi)
         Chem.SanitizeMol(mol)
         reaction = self.bimolecular_reactions[bimolecular_row_idx]
@@ -443,6 +558,11 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
             smi (Union[str, Chem.Mol, Graph]): Molecule as a rdKit Mol object.
             bimolecular_row_idx (int): Index of the bimolecular reaction.
         """
+
+        ### NEW: Just use the helper function for T5 reaction
+        if self.is_t5_bi_rxn(bimolecular_row_idx):
+            return self.t5_bb_mask()
+
         mol = self.get_mol(smi)
         Chem.SanitizeMol(mol)
         reaction = self.bimolecular_reactions[bimolecular_row_idx]
@@ -468,7 +588,13 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
             for reaction in self.bimolecular_reactions
             for reactants in [reaction.rxn.GetReactants()]
         ]).T  # shape (2, num_rxns)
-        return np.any(np.logical_and(self.precomputed_any_bb_reacts, all_matches), axis=0).astype(np.float64)
+        #return np.any(np.logical_and(self.precomputed_any_bb_reacts, all_matches), axis=0).astype(np.float64)
+
+        ### NEW: also check bb for T5 reactions
+        out = np.any(np.logical_and(self.precomputed_any_bb_reacts, all_matches), axis=0).astype(np.float64)
+        if self.num_t5_bi_slots > 0:
+            out = np.concatenate([out, np.full(self.num_t5_bi_slots, float(self.t5_bb_mask().any()))])
+        return out
 
     def get_mol(self, smi: Union[str, Chem.Mol, Graph]) -> Chem.Mol:
         """
@@ -667,6 +793,7 @@ class ReactionTemplateEnv:
         precomputed_bb_masks: np.ndarray = PRECOMPUTED_BB_MASKS,
         fp_type: Optional[str] = None,
         fp_path: Optional[str] = None,
+        t5_config: Optional[dict] = None, ### NEW
     ):
         """A reaction template environment instance"""
         self.ctx = ReactionTemplateEnvContext(
@@ -675,7 +802,58 @@ class ReactionTemplateEnv:
             precomputed_bb_masks=precomputed_bb_masks,
             fp_type=fp_type,
             fp_path=fp_path,
+            t5_config=t5_config, ### NEW
         )
+
+    ### NEW: ReactionT5 helpers
+    def _t5_key_of_bb(self, bb_idx: int) -> str:
+        return self.ctx.state_smiles(self.ctx.building_blocks[bb_idx])
+
+    def _t5_reactants(self, smi, action: GraphAction) -> Tuple[Tuple[str, ...], int, int, int]:
+        """Returns (reactant SMILES tuple, beam slot k, signed slot_id, bb index) for a T5 action.
+        Unimolecular: one reactant (the state), bb = -1. Bimolecular: (state, building block)."""
+        parent = self.ctx.state_smiles(smi)
+        if action.action is GraphActionType.ReactUni:
+            k = self.ctx.t5_uni_slot(action.rxn)
+            return (parent,), k, self.ctx.uni_slot_id(k), -1
+        k = self.ctx.t5_bi_slot(action.rxn)
+        return (parent, self._t5_key_of_bb(action.bb)), k, self.ctx.bi_slot_id(k), int(action.bb)
+
+    def _is_t5_action(self, action: GraphAction) -> bool:
+        return (action.action is GraphActionType.ReactBi and self.ctx.is_t5_bi_rxn(action.rxn)) or (
+            action.action is GraphActionType.ReactUni and self.ctx.is_t5_uni_rxn(action.rxn)
+         )
+ 
+    def prefetch_t5(self, graphs: List[Graph], actions: List[GraphAction]):
+        """Runs ReactionT5 once, batched, for every T5 action of a sampling step (fills the cache)."""
+        reactant_tuples = [self._t5_reactants(g, a)[0] for g, a in zip(graphs, actions) if self._is_t5_action(a)]
+        if reactant_tuples:
+            self.ctx.t5[0].predict_batch(reactant_tuples)
+
+    def t5_step(self, smi: Union[str, Chem.Mol, Graph], action: GraphAction, record: bool = True) -> Chem.Mol:
+        model, store = self.ctx.t5
+        reactants, k, slot_id, bb = self._t5_reactants(smi, action)
+        parent = reactants[0]
+        product = model.predict(reactants, k)
+        if product is None:
+            raise ValueError(f"ReactionT5 returned no valid product in slot {k} for reactants {reactants}")
+        try:
+            product = self.ctx.state_smiles(product)  # same canonical form the env uses for states
+        except Exception as e:
+            raise ValueError(f"ReactionT5 product {product} cannot be represented as a state: {e}")
+        if record:
+            store.add(product, slot_id, parent, bb)
+        return Chem.MolFromSmiles(product)
+
+    def t5_edge_is_consistent(self, parent: Union[str, Chem.Mol, Graph], child: Union[str, Chem.Mol, Graph], action: GraphAction) -> bool:
+        """False if (child, slot) was already recorded with a different parent/bb, i.e. this transition
+        cannot be undone by the deterministic backward action. Such trajectories are marked invalid."""
+        if not self._is_t5_action(action):
+            return True
+        _, _, slot_id, bb = self._t5_reactants(parent, action)
+        edge = self.ctx.t5[1].get(self.ctx.state_smiles(child), slot_id)
+        return edge is not None and edge == (self.ctx.state_smiles(parent), bb)
+    ### end NEW
 
     def new(self) -> Graph:
         smi = random.choice(self.ctx.building_blocks)
@@ -701,9 +879,19 @@ class ReactionTemplateEnv:
         elif action.action is GraphActionType.AddReactant or action.action is GraphActionType.AddFirstReactant:
             return self.ctx.get_mol(self.ctx.building_blocks[action.bb])
         elif action.action is GraphActionType.ReactUni:
+
+            ### NEW: Just run the T5 helper
+            if self.ctx.is_t5_uni_rxn(action.rxn):
+                return self.t5_step(smi, action)
+
             reaction = self.ctx.unimolecular_reactions[action.rxn]
             p = reaction.run_reactants((mol,))
             return p
+
+        ### NEW: What to do for action T5 bimolecule reaction
+        elif self.ctx.is_t5_bi_rxn(action.rxn):
+            return self.t5_step(smi, action)
+        
         else:
             reaction = self.ctx.bimolecular_reactions[action.rxn]
             reactant2 = self.ctx.get_mol(self.ctx.building_blocks[action.bb])
@@ -734,6 +922,15 @@ class ReactionTemplateEnv:
         if action.action is GraphActionType.BckRemoveFirstReactant:
             return self.ctx.get_mol(""), None, None
         elif action.action is GraphActionType.BckReactUni:
+
+            ### New: What to do backward if it is a T5 reaction
+            if self.ctx.is_t5_uni_rxn(action.rxn):
+                # Unimolecular ReactionT5 cannot be inverted: use the recorded edge (no reactant removed).
+                edge = self.ctx.t5[1].get(self.ctx.state_smiles(mol), self.ctx.uni_slot_id(self.ctx.t5_uni_slot(action.rxn)))
+                if edge is None:
+                    raise ValueError(f"No recorded unimolecular ReactionT5 edge for {Chem.MolToSmiles(mol)}")
+                return Chem.MolFromSmiles(edge[0]), None, None
+
             if self.ctx.reverse_reactions is not None:
                 reaction = self.ctx.reverse_unimolecular_reactions[action.rxn]
                 return reaction.run_reverse_reactants((mol,), reaction.rxn), None, None
@@ -744,6 +941,17 @@ class ReactionTemplateEnv:
                     None,
                     None,
                 )  # return the product and None (no reactant was removed)
+
+        ### New: What to do backward if it is a T5 reaction
+        elif self.ctx.is_t5_bi_rxn(action.rxn):
+            # Bimolecular ReactionT5 cannot be inverted: use the edge recorded when this product was generated.
+            slot_id = self.ctx.bi_slot_id(self.ctx.t5_bi_slot(action.rxn))
+            edge = self.ctx.t5[1].get(self.ctx.state_smiles(mol), slot_id)
+            if edge is None:
+                raise ValueError(f"No recorded ReactionT5 edge for {Chem.MolToSmiles(mol)}, slot {self.ctx.t5_bi_slot(action.rxn)}")
+            parent_smi, bb_idx = edge
+            return Chem.MolFromSmiles(parent_smi), 0, bb_idx
+
         else:  # if bimolecular
             if self.ctx.reverse_reactions is not None:
                 reaction = self.ctx.reverse_bimolecular_reactions[action.rxn]

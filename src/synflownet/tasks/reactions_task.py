@@ -257,6 +257,23 @@ class ReactionTrainer(StandardOnlineTrainer):
         with open(precomputed_bb_masks_path, "rb") as f:
             precomputed_bb_masks = pickle.load(f)
 
+        ### NEW: Init T5 configs
+        rcfg = self.cfg.task.reactions_task
+        t5_config = None
+        if rcfg.use_reaction_t5:
+            t5_config = dict(
+                model_name=rcfg.t5_model_name,
+                num_beams=rcfg.t5_num_beams,
+                device=rcfg.t5_device,
+                max_heavy_atoms=rcfg.t5_max_heavy_atoms,
+                provenance_db=rcfg.t5_provenance_db,
+                # read by the env context, not passed to the model
+                num_bi_slots=rcfg.t5_num_bi_slots,
+                num_uni_slots=rcfg.t5_num_uni_slots,
+                bb_mask=rcfg.t5_bb_mask,
+                max_state_heavy_atoms=rcfg.t5_max_state_heavy_atoms,
+            )
+
         self.ctx = ReactionTemplateEnvContext(
             num_cond_dim=self.task.num_cond_dim,
             building_blocks=building_blocks,
@@ -265,6 +282,7 @@ class ReactionTrainer(StandardOnlineTrainer):
             fp_type=self.cfg.model.graph_transformer.fingerprint_type,
             fp_path=self.cfg.model.graph_transformer.fingerprint_path,
             strict_bck_masking=self.cfg.algo.strict_bck_masking,
+            t5_config=t5_config,
         )
         self.env = ReactionTemplateEnv(
             reaction_templates=reaction_templates,
@@ -272,6 +290,7 @@ class ReactionTrainer(StandardOnlineTrainer):
             precomputed_bb_masks=precomputed_bb_masks,
             fp_type=self.cfg.model.graph_transformer.fingerprint_type,
             fp_path=self.cfg.model.graph_transformer.fingerprint_path,
+            t5_config=t5_config,
         )
 
     def setup_sampler(self):

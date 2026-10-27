@@ -19,8 +19,13 @@ def precompute_bb_masks(path):
     ctx = ReactionTemplateEnvContext(building_blocks=building_blocks)
 
     print("Precomputing building blocks masks for each reaction and reactant position...")
-    masks = np.zeros((2, ctx.num_bimolecular_rxns, ctx.num_building_blocks))
-    for rxn_i in tqdm(range(ctx.num_bimolecular_rxns)):
+    #masks = np.zeros((2, ctx.num_bimolecular_rxns, ctx.num_building_blocks))
+    #for rxn_i in tqdm(range(ctx.num_bimolecular_rxns)):
+    
+    ### NEW: Specify only 'template' reactions and not T5
+    masks = np.zeros((2, ctx.num_template_bimolecular_rxns, ctx.num_building_blocks))
+    for rxn_i in tqdm(range(ctx.num_template_bimolecular_rxns)):  
+
         reaction = ctx.bimolecular_reactions[rxn_i]
         reactants = reaction.rxn.GetReactants()
         for bb_j, bb in enumerate(ctx.building_blocks_mols):

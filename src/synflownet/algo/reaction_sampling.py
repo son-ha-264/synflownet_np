@@ -96,6 +96,11 @@ class SynthesisSampler(Sampler):
                 nx_graphs=nx_graphs, model=model, random_action_prob=random_action_prob, use_argmax=use_argmax
             )
             graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=True) for g, a in zip(torch_graphs, actions)]
+
+            ### NEW: one batched ReactionT5 call for all trajectories that picked a T5 slot at this step
+            if getattr(self.ctx, "num_t5_bi_slots", 0) > 0 or getattr(self.ctx, "num_t5_uni_slots", 0) > 0:
+                self.env.prefetch_t5(nx_graphs, graph_actions)
+
             # Step each trajectory, and accumulate statistics
             for i, j in zip(not_done(range(n)), range(n)):
                 data[i]["traj"].append((graphs[i], graph_actions[j]))
@@ -112,8 +117,17 @@ class SynthesisSampler(Sampler):
                     bck_a[i].append(GraphAction(GraphActionType.Stop))
                 else:  # If not done, step the self.environment
                     gp = graphs[i]
-                    gp = self.env.step(graphs[i], graph_actions[j])
+                    #gp = self.env.step(graphs[i], graph_actions[j])
                     try:
+
+                        ### NEW: inside the try: a ReactionT5 step can fail (no valid product in that beam slot)
+                        gp = self.env.step(graphs[i], graph_actions[j])
+                        ### NEW: Keep the product -> reactant map injective for the backward policy of GFlowNet 
+                        if hasattr(self.env, "t5_edge_is_consistent") and not self.env.t5_edge_is_consistent(
+                            graphs[i], gp, graph_actions[j]
+                        ):
+                            raise ValueError("ReactionT5 product already reached from a different parent via this slot")
+
                         b_a = self.env.reverse(gp, graph_actions[j])
                         if strict_forward_policy:
                             bck_mol, both_are_bb, bb_idx = self.env.backward_step(gp, b_a)
