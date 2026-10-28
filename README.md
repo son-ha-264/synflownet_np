@@ -26,6 +26,7 @@ This package is installable as a PIP package, but since it depends on some torch
 conda create --name sfn python=3.10.14
 conda activate sfn
 pip install -e . --find-links https://data.pyg.org/whl/torch-2.1.2+cu121.html
+pip install transformers 
 ```
 Or for CPU use:
 

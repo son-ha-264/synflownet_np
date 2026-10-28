@@ -11,7 +11,7 @@ from synflownet.envs.synthesis_building_env import ReactionTemplateEnvContext
 
 def precompute_bb_masks(path):
 
-    building_blocks_path = Path(__file__).parent / "enamine_bbs.txt"
+    building_blocks_path = Path(__file__).parent / "synthemol_bbs.txt"
 
     with open(building_blocks_path, "r") as f:
         building_blocks = f.readlines()
@@ -46,7 +46,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out_path",
         type=str,
-        default=Path(__file__).parent / "precomputed_bb_masks_enamine_bbs.pkl",
+        default=Path(__file__).parent / "precomputed_bb_masks_synthemol_bbs.pkl",
     )
     args = parser.parse_args()
     precompute_bb_masks(args.out_path)

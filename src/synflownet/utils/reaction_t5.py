@@ -76,7 +76,7 @@ class ReactionT5Forward:
         # order-invariant for two reactants: A + B and B + A are the same reaction
         return tuple(sorted(cans)) if len(cans) == 2 else cans
 
-    def _postprocess(self, products: List[str], seq_scores: List[float], reactant_smiles: Tuple[str, ...], lam=0.2) -> List[str]:
+    def _postprocess(self, products: List[str], seq_scores: List[float], reactant_smiles: Tuple[str, ...], lam=0.0) -> List[str]:
         ### TODO!!!: Add the filtering steps per SyntheMol_NP
         out: List[str] = []
         #for s in raw:

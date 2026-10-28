@@ -31,6 +31,11 @@ from synflownet.utils.gpu_vina import QuickVina2GPU
 from synflownet.utils.misc import get_worker_device
 from synflownet.utils.transforms import to_logreward
 
+import sys, os
+from rdkit.Chem import RDConfig
+sys.path.append(os.path.join(RDConfig.RDContribDir, 'NP_Score'))
+import npscorer
+
 # Write any local overrides required here
 LOCAL_OVERRIDES = "local_overrides.yaml"
 from synflownet.envs.graph_building_env import Graph
@@ -57,6 +62,7 @@ class ReactionTask(GFNTask):
         self.models = self._load_task_models()
         self.temperature_conditional = TemperatureConditional(cfg)
         self.num_cond_dim = self.temperature_conditional.encoding_size()
+        self.fscore = npscorer.readNPModel()
 
     def _load_task_models(self):
         model = bengio2021flow.load_original_model()
@@ -137,6 +143,13 @@ class ReactionTask(GFNTask):
         sas = ((10 - sas) / (10 - 3.5)).clamp(0, 1)
         return torch.tensor(sas).float().clip(1e-4, 100)
 
+    ### NEW: Custom reward functions
+    def npscorer(self, mols: List[RDMol]) -> Tensor:
+        vals = []
+        for m in mols:
+            vals.append((npscorer.scoreMol(m,self.fscore)+5)/10)
+        return torch.tensor(vals).float().clip(1e-4, 100)
+
     def compute_reward_from_graph(self, graphs: List[gd.Data], mols: List[Chem.Mol], traj_lens: Tensor) -> Tensor:
         if self.reward == "seh_reaction":
             return self.seh_proxy_reward_from_graph(graphs, mols, traj_lens)
@@ -166,17 +179,31 @@ class ReactionTask(GFNTask):
                 if mol.GetNumHeavyAtoms() > 37:
                     seh_scores[i] += -0.4
             return seh_scores
+        elif self.reward == "npscore":
+            return self.npscorer(mols)
         else:
             raise ValueError(f"Unknown task {self.task}")
 
-    def compute_obj_properties(self, mols: List[RDMol], traj_lens: Tensor, **kwargs) -> Tuple[ObjectProperties, Tensor]:
+    ### NEW: 2 Validity filters, one for SEH tasks which requires graoh validity, and the other which does not
+    def _reward_needs_seh_graph(self) -> bool:
+        SEH_REWARDS = ("seh_reaction", "seh_qed", "seh_sa", "seh_mol_wt")
+        # None defaults to the SEH proxy; "efficiency"/"size_penalty..." are seh sub-modes set
+        # via cfg.task.reactions_task.reward while self.reward stays "seh_reaction"
+        return self.reward is None or self.reward in SEH_REWARDS or self.reward.startswith("seh")
+
+    def compute_obj_properties(self, mols, traj_lens, **kwargs):
+        if self._reward_needs_seh_graph():
+            return self._compute_obj_properties_seh(mols, traj_lens, **kwargs)
+        return self._compute_obj_properties_mol(mols, traj_lens, **kwargs)
+
+    # 1) SEH path: ORIGINAL body, just renamed (validity from the SEH featurizer)
+    def _compute_obj_properties_seh(self, mols, traj_lens, **kwargs):
         graphs = []
         for i in mols:
             try:
                 g = bengio2021flow.mol2graph(i)
             except IndexError:
-                # NOTE: affinity model does not have all atom types found in BBs
-                # so for now we mark such molecules as invalid
+                # affinity model lacks some atom types in BBs -> mark invalid
                 g = None
             graphs.append(g)
 
@@ -186,7 +213,28 @@ class ReactionTask(GFNTask):
 
         preds = self.compute_reward_from_graph(graphs=graphs, mols=mols, traj_lens=traj_lens).reshape((-1, 1))
         assert len(preds) == is_valid.sum(), f"len(preds)={len(preds)}, is_valid.sum()={is_valid.sum()}"
+        return ObjectProperties(preds), is_valid
 
+    # 2) Non-SEH path: RDKit validity, no SEH graph
+    def _compute_obj_properties_mol(self, mols, traj_lens, **kwargs):
+        def _ok(m):
+            if m is None:
+                return False
+            try:
+                Chem.SanitizeMol(Chem.Mol(m))   # don't mutate the original
+                return True
+            except Exception:
+                return False
+
+        is_valid = torch.tensor([_ok(m) for m in mols]).bool()
+        if not is_valid.any():
+            return ObjectProperties(torch.zeros((0, 1))), is_valid
+
+        valid_mols = [m for m, v in zip(mols, is_valid) if v]
+        preds = self.compute_reward_from_graph(
+            graphs=[None] * len(valid_mols), mols=valid_mols, traj_lens=traj_lens
+        ).reshape((-1, 1))
+        assert len(preds) == is_valid.sum(), f"len(preds)={len(preds)}, is_valid.sum()={is_valid.sum()}"
         return ObjectProperties(preds), is_valid
 
 
@@ -196,7 +244,7 @@ class ReactionTrainer(StandardOnlineTrainer):
     def set_default_hps(self, cfg: Config):
         cfg.hostname = socket.gethostname()
         cfg.pickle_mp_messages = False
-        cfg.num_workers = 8
+        cfg.num_workers = 2
         cfg.opt.learning_rate = 1e-4
         cfg.opt.weight_decay = 1e-8
         cfg.opt.momentum = 0.9
@@ -372,7 +420,7 @@ def main(wandb_run_name, backoff=False):
         config.log_dir = f"./logs/debug_run_reactions_task_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         config.device = "cuda" if torch.cuda.is_available() else "cpu"
         config.overwrite_existing_exp = True
-        config.num_training_steps = 5000
+        config.num_training_steps = 5#000
         config.validate_every = 500
         config.num_final_gen_steps = 100
         config.num_workers = 0
@@ -414,6 +462,9 @@ def main(wandb_run_name, backoff=False):
 
         trial = ReactionTrainer(config)
     trial.run()
+
+
+
 
 
 if __name__ == "__main__":
