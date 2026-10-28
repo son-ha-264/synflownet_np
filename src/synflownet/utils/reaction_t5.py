@@ -138,7 +138,11 @@ class ReactionT5Forward:
             score[picked] = -np.inf
             picked.append(int(score.argmax()))
 
-        return [smis[i] for i in picked]      
+        out = [smis[i] for i in picked]      
+        # Sort by smiles length, bigger first
+        out = sorted(out, key=len, reverse=True)
+
+        return out  
     
         
     def predict_batch(self, reactant_tuples: Sequence[Sequence[str]], batch_size: int = 32) -> List[List[str]]:
