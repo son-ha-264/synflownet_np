@@ -20,7 +20,7 @@ class ReactionTaskConfig:
     sanitize_building_blocks: bool = False
     ### NEW: ---- ReactionT5 forward model as extra "virtual" bimolecular reactions ----
     use_reaction_t5: bool = True
-    t5_model_name: str = "/home/sonh/MAINCE_project/pretrained/rt5_ft_uspto_npl_custom_replay01_kl01/best"
+    t5_model_name: str = "/media/scratch/sonha/huggingface_models/rt5_ft_uspto_npl_custom_replay01_kl01/best/"
     t5_num_bi_slots: int = 3  # K extra children per (state, bb) pair via bimolecular ReactionT5 (0 disables)
     t5_num_uni_slots: int = 3  # K extra children per state via unimolecular ReactionT5, run on the state alone (0 disables)
     t5_num_beams: int = 10  # beams searched to find K distinct, valid products

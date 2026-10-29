@@ -160,3 +160,5 @@ cython_debug/
 #.idea/
 
 src/synflownet/data/building_blocks/*.pkl
+slurm_logs/
+logs/

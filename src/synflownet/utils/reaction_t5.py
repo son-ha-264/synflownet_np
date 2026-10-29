@@ -23,6 +23,9 @@ RDLogger.DisableLog("rdApp.*")
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+from rdkit.Chem import rdFingerprintGenerator
+_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
+
 
 def canonical(smi: str) -> Optional[str]:
     """Canonical, stereo-free SMILES (SynFlowNet's graphs drop stereochemistry)."""
@@ -81,9 +84,12 @@ class ReactionT5Forward:
         out: List[str] = []
         #for s in raw:
         scored_beam = list(zip(products, seq_scores))
-        out = self._select(reactant_smiles=reactant_smiles, scored_beam=scored_beam, products_from_smarts=None, k=self.num_slots, lam=lam)
+        out = self._select(reactant_smiles=reactant_smiles, scored_beam=scored_beam, k=self.num_slots, lam=lam)
         return out
 
+    def _fp(self, mol):
+        return _GEN.GetCountFingerprintAsNumPy(mol).astype(np.float32)
+    
     def _select(self, reactant_smiles, scored_beam, k, lam):
         """beam: [(product_smiles, logprob)]
         One reaction with multiple possible reactants
@@ -161,8 +167,9 @@ class ReactionT5Forward:
                     num_return_sequences=self.num_beams,
                     max_length=self.max_length,
                     early_stopping=True,
+                    return_dict_in_generate=True, output_scores=True
                 )
-            dec = self.tokenizer.batch_decode(gen, skip_special_tokens=True)
+            dec = self.tokenizer.batch_decode(gen['sequences'], skip_special_tokens=True)
             seq_scores = gen.sequences_scores
             with self._lock:
                 for j, k in enumerate(chunk):

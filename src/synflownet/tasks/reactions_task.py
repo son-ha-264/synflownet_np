@@ -37,7 +37,7 @@ sys.path.append(os.path.join(RDConfig.RDContribDir, 'NP_Score'))
 import npscorer
 
 # Write any local overrides required here
-LOCAL_OVERRIDES = "local_overrides.yaml"
+LOCAL_OVERRIDES = "/media/scratch/sonha/projects/synflownet_np/src/synflownet/tasks/local_overrides.yaml"
 from synflownet.envs.graph_building_env import Graph
 
 
@@ -420,7 +420,7 @@ def main(wandb_run_name, backoff=False):
         config.log_dir = f"./logs/debug_run_reactions_task_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         config.device = "cuda" if torch.cuda.is_available() else "cpu"
         config.overwrite_existing_exp = True
-        config.num_training_steps = 5#000
+        config.num_training_steps = 5000
         config.validate_every = 500
         config.num_final_gen_steps = 100
         config.num_workers = 0
@@ -444,15 +444,15 @@ def main(wandb_run_name, backoff=False):
         if hasattr(config, "wandb"):
             wandb.init(project=config.wandb.project, entity=config.wandb.entity, config=config)
         config.algo.max_len = 3
-        config.algo.tb.backward_policy = "MaxLikelihood"
-        config.algo.tb.do_parameterize_p_b = True
+        config.algo.tb.backward_policy = 'Uniform' #"MaxLikelihood"
+        config.algo.tb.do_parameterize_p_b = False #True
         config.algo.tb.do_sample_p_b = False
         config.replay.use = False
         config.algo.synthesis_cost_as_bck_reward = False
         config.algo.tb.reinforce_loss_multiplier = 1.0
         config.algo.tb.bck_entropy_loss_multiplier = 1.0
         config.algo.num_from_policy = 64
-        config.algo.num_from_buffer_for_pb = 64
+        config.algo.num_from_buffer_for_pb = 0 #64
 
         config.algo.strict_forward_policy = False  # If True, a fwd action is allowed only if in reverse it produces the exact same reaction (identical reactants and products)
         config.algo.strict_bck_masking = (

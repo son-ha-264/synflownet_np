@@ -1,0 +1,10 @@
+reward: npscore      
+
+task:
+  reactions_task:
+    use_reaction_t5: true
+    t5_num_uni_slots: 3
+    t5_num_bi_slots: 3
+    t5_num_beams: 10
+    t5_bb_mask: template_reactive 
+    t5_device: cuda
