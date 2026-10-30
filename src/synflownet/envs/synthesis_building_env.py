@@ -771,13 +771,19 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
             smi_traj.append((Chem.MolToSmiles(mol), i[1]))
         return str(smi_traj)
 
+    ### NEW: force long indices and handle the empty case
     def precompute_secondary_masks(self, actions, nx_graphs):
         idcs, masks = [], []
         for i, (g, a) in enumerate(zip(nx_graphs, actions)):
             if self.aidx_to_action_type(a) is GraphActionType.ReactBi:
                 masks.append(self.create_masks_for_bb_from_precomputed(g, a.row_idx))
                 idcs.append(i)
-        return {GraphActionType.AddReactant: (torch.tensor(np.array(idcs)), torch.tensor(np.array(masks)))}
+        idcs_t = torch.tensor(idcs, dtype=torch.long)                       # long, even when empty
+        if len(masks):
+            masks_t = torch.as_tensor(np.array(masks), dtype=torch.float64)
+        else:
+            masks_t = torch.zeros((0, self.num_building_blocks), dtype=torch.float64)  # correct 2-D shape
+        return {GraphActionType.AddReactant: (idcs_t, masks_t)}
 
 class ReactionTemplateEnv:
     """Molecules and reaction templates environment. The new, initial states are Enamine building block molecules.
@@ -1288,7 +1294,11 @@ class ActionCategorical:
         )
         self.batch.append(torch.arange(self.graphs.num_graphs, device=self.dev))
 
+    ### NEW: An empty update is explicitly skipped
     def set_secondary_masks(self, atype, idcs, masks):
+        if idcs.numel() == 0:
+            self._has_secondary_masks[atype] = True
+            return
         self._action_masks[self.ctx.action_type_to_aidx(atype)][idcs] = masks
         self._has_secondary_masks[atype] = True
 

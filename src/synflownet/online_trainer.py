@@ -137,13 +137,20 @@ class StandardOnlineTrainer(GFNTrainer):
         state["optimizer_state_dict"] = self.opt.state_dict()
         return state
 
+    ### NEW: Move the optimizer state onto the device after loading to avoid after loading a checkpoint, Adam momentum is still in cpu and model in cuda
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path):
-        state = torch.load(checkpoint_path)
+        state = torch.load(checkpoint_path, map_location="cpu")
         config = Config(**state["cfg"])
         trainer = cls(config)
         trainer.model.load_state_dict(state["models_state_dict"][0])
         trainer.opt.load_state_dict(state["optimizer_state_dict"])
+        # load_state_dict restores Adam's exp_avg/exp_avg_sq on CPU; move them to the training
+        # device so opt.step() matches the (cuda) model params.
+        for st in trainer.opt.state.values():
+            for k, v in st.items():
+                if torch.is_tensor(v):
+                    st[k] = v.to(trainer.device)
         trainer.cfg.start_at_step = state["step"]
         print(f"Loaded checkpoint at {checkpoint_path}. Starting at step {trainer.cfg.start_at_step}")
         return trainer
