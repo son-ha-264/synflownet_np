@@ -127,6 +127,8 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
         building_blocks_costs: Optional[dict] = BUILDING_BLOCKS_COSTS,
         strict_bck_masking: bool = True,
         t5_config: Optional[dict] = None, ### NEW argument for T5
+        first_reactant_reactive_only: bool = False, ### NEW argument to avoid only returning the bb
+        min_reaction_steps: int = 1, ### NEW argument to avoid only returning the bb
     ):
         """An env context for generating molecules by sequentially applying reaction templates.
         Contains functionalities to build molecular create masks for actions, and convert molecules to other representations.
@@ -197,6 +199,15 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
         self.num_unimolecular_rxns = self.num_template_unimolecular_rxns + self.num_t5_uni_slots
         self.num_bimolecular_rxns = self.num_template_bimolecular_rxns + self.num_t5_bi_slots
         self._t5_backend = None  # loaded lazily, once per process (see `t5`)
+
+        ### NEW: Template-usage shaping
+        # If True, AddFirstReactant may only pick building blocks that can actually react (prevents
+        # starting a trajectory from an inert BB that is then forced to Stop immediately).
+        self.first_reactant_reactive_only = first_reactant_reactive_only
+        # Number of reaction steps required before Stop is allowed (the no-reaction-possible fallback in
+        # graph_to_Data still lets genuinely unreactable states terminate early). 1 == original behaviour.
+        self.min_reaction_steps = int(min_reaction_steps)
+        self._reactive_bb_mask_cache = None
 
         if rev_reaction_templates is not None:
             self.reverse_reactions = [Reaction(template=t) for t in rev_reaction_templates]
@@ -396,6 +407,31 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
 
         return ActionIndex(action_type=type_idx, row_idx=row_idx, col_idx=col_idx)
 
+    ### NEW: Restrict AddFirstReactant to choosing only react-able BB
+    def reactive_bb_mask(self) -> np.ndarray:
+        """Boolean (as float) vector over building blocks: 1 if the BB can start a reaction, i.e. it can
+        serve as a reactant of some template with a compatible partner (bimolecular) or of a unimolecular
+        template. Cached; used to restrict AddFirstReactant. Falls back to all-ones if masks are missing."""
+        if self._reactive_bb_mask_cache is None:
+            n_bb = self.num_building_blocks
+            can = np.zeros(n_bb, dtype=bool)
+            if self.precomputed_bb_masks is not None:
+                mb = np.asarray(self.precomputed_bb_masks, dtype=bool)  # (2, n_template_bi, n_bb)
+                any_bb = mb.any(axis=2)  # (2, n_template_bi): does some BB fill position p of template r
+                for p in (0, 1):
+                    ok_rxn = any_bb[1 - p]  # templates whose OTHER position is fillable
+                    if ok_rxn.any():
+                        can |= mb[p][ok_rxn].any(axis=0)
+            # unimolecular templates (usually few): a BB that is a reactant on its own
+            for r in self.unimolecular_reactions:
+                for i, bb in enumerate(self.building_blocks_mols):
+                    if not can[i] and bb is not None and r.is_reactant(bb):
+                        can[i] = True
+            if not can.any():  # nothing reactable (e.g. masks absent) -> don't lock the policy out
+                can[:] = True
+            self._reactive_bb_mask_cache = can.astype(np.float64)
+        return self._reactive_bb_mask_cache
+
     def create_masks(self, smi: Union[str, Chem.Mol, Graph], action_type: GraphActionType, traj_len: int) -> Union[List[int], Any]:  # type: ignore
         """Creates masks for actions given the molecule and action type.
 
@@ -427,11 +463,22 @@ class ReactionTemplateEnvContext(GraphBuildingEnvContext):
         ) or (traj_len > 0 and action_type == GraphActionType.AddFirstReactant):
             return np.zeros(masks_len[action_type])
         elif traj_len == 0 and action_type == GraphActionType.AddFirstReactant:
+            ### NEW: optionally restrict the first reactant to building blocks that can actually react
+            if self.first_reactant_reactive_only:
+                return self.reactive_bb_mask().copy()
             return np.ones(masks_len[action_type])  # no masks for AddFirstReactant
-        elif traj_len == 1 and action_type == GraphActionType.Stop:
+        #elif traj_len == 1 and action_type == GraphActionType.Stop:
+        ### NEW
+        elif action_type == GraphActionType.Stop:
+            # Stop allowed only after >= min_reaction_steps reactions have happened (traj_len counts the
+            # AddFirstReactant too, so #reactions = traj_len - 1). The no-reaction-possible fallback in
+            # graph_to_Data still force-unmasks Stop for genuinely unreactable states, so this never
+            # deadlocks. traj_len == 0 is handled above (Stop masked before the first reactant).
+            if traj_len - 1 >= max(1, self.min_reaction_steps):
+                return np.ones(masks_len[action_type])
             return np.zeros(masks_len[action_type])
-        elif traj_len != 1 and action_type == GraphActionType.Stop:
-            return np.ones(masks_len[action_type])
+        #elif traj_len != 1 and action_type == GraphActionType.Stop:
+        #    return np.ones(masks_len[action_type])
         elif action_type == GraphActionType.BckRemoveFirstReactant:
             smi = Chem.MolToSmiles(self.get_mol(smi))  # type: ignore
             if smi in self.building_blocks_set:
@@ -800,6 +847,9 @@ class ReactionTemplateEnv:
         fp_type: Optional[str] = None,
         fp_path: Optional[str] = None,
         t5_config: Optional[dict] = None, ### NEW
+        first_reactant_reactive_only: bool = False, ### NEW
+        min_reaction_steps: int = 1, ### NEW
+        add_hs: bool = False, ### NEW
     ):
         """A reaction template environment instance"""
         self.ctx = ReactionTemplateEnvContext(
@@ -809,6 +859,9 @@ class ReactionTemplateEnv:
             fp_type=fp_type,
             fp_path=fp_path,
             t5_config=t5_config, ### NEW
+            first_reactant_reactive_only=first_reactant_reactive_only, ### NEW
+            min_reaction_steps=min_reaction_steps, ### NEW
+            add_hs=add_hs, ### NEW
         )
 
     ### NEW: ReactionT5 helpers

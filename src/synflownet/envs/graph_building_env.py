@@ -626,6 +626,13 @@ class GraphActionCategorical:
         self._apply_action_masks()
 
     def _apply_action_masks(self):
+        # Numerical guard: a single non-finite logit from the model forward pass (e.g. an occasional
+        # nan/inf on a rare/large add_hs graph) otherwise makes that graph's per-graph max in logsoftmax
+        # non-finite, turning every log_prob for it into nan -> "loss is not finite" crash. Clamp to a
+        # finite range: nan -> strongly-negative (effectively masked), +/-inf -> large finite bounds.
+        self.raw_logits = [
+            torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4) for logits in self.raw_logits
+        ]
         self._masked_logits = (
             [self._mask(logits, mask) for logits, mask in zip(self.raw_logits, self._action_masks)]
             if self._action_masks is not None

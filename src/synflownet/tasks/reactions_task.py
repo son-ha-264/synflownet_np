@@ -147,7 +147,10 @@ class ReactionTask(GFNTask):
     def npscorer(self, mols: List[RDMol]) -> Tensor:
         vals = []
         for m in mols:
-            vals.append((npscorer.scoreMol(m,self.fscore)+5)/10)
+            try:
+                vals.append((npscorer.scoreMol(m,self.fscore)+5)/10)
+            except Exception:
+                vals.append(1e-4)
         return torch.tensor(vals).float().clip(1e-4, 100)
 
     def compute_reward_from_graph(self, graphs: List[gd.Data], mols: List[Chem.Mol], traj_lens: Tensor) -> Tensor:
@@ -186,7 +189,7 @@ class ReactionTask(GFNTask):
 
     ### NEW: 2 Validity filters, one for SEH tasks which requires graoh validity, and the other which does not
     def _reward_needs_seh_graph(self) -> bool:
-        SEH_REWARDS = ("seh_reaction", "seh_qed", "seh_sa", "seh_mol_wt")
+        SEH_REWARDS = ("seh_reaction", "seh_qed", "seh_sa", "seh_mol_wt", "reward_one")
         # None defaults to the SEH proxy; "efficiency"/"size_penalty..." are seh sub-modes set
         # via cfg.task.reactions_task.reward while self.reward stays "seh_reaction"
         return self.reward is None or self.reward in SEH_REWARDS or self.reward.startswith("seh")
@@ -331,6 +334,9 @@ class ReactionTrainer(StandardOnlineTrainer):
             fp_path=self.cfg.model.graph_transformer.fingerprint_path,
             strict_bck_masking=self.cfg.algo.strict_bck_masking,
             t5_config=t5_config,
+            first_reactant_reactive_only=rcfg.first_reactant_reactive_only,
+            min_reaction_steps=rcfg.min_reaction_steps,
+            add_hs=rcfg.add_hs,
         )
         self.env = ReactionTemplateEnv(
             reaction_templates=reaction_templates,
@@ -339,6 +345,9 @@ class ReactionTrainer(StandardOnlineTrainer):
             fp_type=self.cfg.model.graph_transformer.fingerprint_type,
             fp_path=self.cfg.model.graph_transformer.fingerprint_path,
             t5_config=t5_config,
+            first_reactant_reactive_only=rcfg.first_reactant_reactive_only,
+            min_reaction_steps=rcfg.min_reaction_steps,
+            add_hs=rcfg.add_hs,
         )
 
     def setup_sampler(self):
@@ -390,7 +399,7 @@ def main(wandb_run_name, backoff=False):
     """Example of how this trainer can be run"""
 
     name = None
-    checkpoint_path = None
+    checkpoint_path = "/media/scratch/sonha/projects/synflownet_np/logs/debug_run_reactions_task_2026-11-09_12-26-07/model_state.pt"
     if backoff:
         assert wandb_run_name is not None
         logroot = "./logs"
@@ -444,15 +453,22 @@ def main(wandb_run_name, backoff=False):
         if hasattr(config, "wandb"):
             wandb.init(project=config.wandb.project, entity=config.wandb.entity, config=config)
         config.algo.max_len = 3
-        config.algo.tb.backward_policy = 'Uniform' #"MaxLikelihood"
-        config.algo.tb.do_parameterize_p_b = False #True
+
+        config.algo.tb.backward_policy = 'Uniform'    # Change to this to turn off backward policy
+        #config.algo.tb.backward_policy = 'MaxLikelihood'
+
+        config.algo.tb.do_parameterize_p_b = False     # Change to this to turn off backward policy
+        #config.algo.tb.do_parameterize_p_b = True
+
         config.algo.tb.do_sample_p_b = False
         config.replay.use = False
         config.algo.synthesis_cost_as_bck_reward = False
         config.algo.tb.reinforce_loss_multiplier = 1.0
         config.algo.tb.bck_entropy_loss_multiplier = 1.0
         config.algo.num_from_policy = 64
-        config.algo.num_from_buffer_for_pb = 0 #64
+
+        config.algo.num_from_buffer_for_pb = 0 
+        #config.algo.num_from_buffer_for_pb = 64
 
         config.algo.strict_forward_policy = False  # If True, a fwd action is allowed only if in reverse it produces the exact same reaction (identical reactants and products)
         config.algo.strict_bck_masking = (

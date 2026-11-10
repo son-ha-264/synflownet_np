@@ -29,6 +29,9 @@ class ReactionTaskConfig:
     t5_max_heavy_atoms: Optional[int] = 100  # discard T5 products larger than this
     t5_max_state_heavy_atoms: Optional[int] = None  # forbid T5 actions on states larger than this
     t5_provenance_db: Optional[str] = None  # SQLite path to share recorded T5 edges across workers
+    first_reactant_reactive_only: bool = False  # AddFirstReactant may only pick BBs that can react
+    min_reaction_steps: int = 1  # reactions required before Stop is allowed (1 == original behaviour)    
+    add_hs: bool = False
 
 
 @dataclass
